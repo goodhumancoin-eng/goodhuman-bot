@@ -1,28 +1,29 @@
 """
-GOODHUMAN Telegram bot — v5 (Groq LLM + native Telegram GIFs, no API key).
+GOODHUMAN Telegram bot — v8.
 
-How GIFs work now:
-- The bot AUTOMATICALLY remembers every GIF (animation) posted in the group,
-  storing its Telegram file_id. On a GIF turn it re-posts a random remembered one.
-- So: use Telegram's GIF button, search "robot", post ~15 robot gifs in the group
-  ONCE. The bot builds its own library. No API key, no hosting.
-- It saves the library to gifs.json so it survives restarts (best effort).
-- Admin commands: /addgif (reply to a gif to add it), /gifcount, /cleargifs.
+New in v8:
+- Auto interval: 45 min (fastest) up to 3 h (slowest when quiet)...
+  ...BUT drops to ~15 min if the group had >3 user messages in the last 24h.
+- Auto-messages can @tag a recent (non-admin) member to ask them a question.
+- The bot does NOT reply to messages from ADMINS (it stays out of admin chatter),
+  but it replies to all other members. Commands (/ca /buy /rules) still work for all.
+- Keeps: Groq answers, native-Telegram GIF library, bonding-curve milestones,
+  per-user STOP.
 
-Animation:
-- Variable interval MIN_MINUTES..MAX_MINUTES (default 1..5), only if group is quiet.
-- Each turn: 1/3 GIF, 1/3 AI message, 1/3 keyword reminder.
-- Always answers real questions via the LLM. Per-user STOP works.
-
-Env vars (Railway):
-    TELEGRAM_TOKEN, GROQ_API_KEY, GOODHUMAN_CA   (required)
-    MIN_MINUTES=1 MAX_MINUTES=5 QUIET_MINUTES=2  (optional)
-    GROQ_MODEL=llama-3.3-70b-versatile           (optional)
+Env (Railway):
+    TELEGRAM_TOKEN, GROQ_API_KEY, GOODHUMAN_CA        (required)
+    MIN_MINUTES=45  MAX_MINUTES=180  ACTIVE_MINUTES=15
+    ACTIVE_THRESHOLD=3        (>N user msgs / 24h => use ACTIVE_MINUTES)
+    RAMP_MINUTES=120          (idle minutes to reach MAX when not active)
+    TAG_CHANCE=0.4            (chance an AI message tags a member)
+    CURVE_CHECK_MINUTES=3     GROQ_MODEL=llama-3.3-70b-versatile
 """
 
 import os, random, logging, time, json
+from collections import deque
 from pathlib import Path
 
+import httpx
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
@@ -36,33 +37,46 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 CA = os.environ.get("GOODHUMAN_CA", "B3se9Adv6kPZeqqo1QsS3wfoBKjfrjWVtVDqAASApump")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-MIN_MINUTES = float(os.environ.get("MIN_MINUTES", "3"))   # fastest (when active)
-MAX_MINUTES = float(os.environ.get("MAX_MINUTES", "20"))  # slowest (when quiet)
-# idle time (min) at which we reach MAX_MINUTES; below it, delay scales down
-RAMP_MINUTES = float(os.environ.get("RAMP_MINUTES", "15"))
+
+MIN_MINUTES = float(os.environ.get("MIN_MINUTES", "45"))
+MAX_MINUTES = float(os.environ.get("MAX_MINUTES", "180"))
+ACTIVE_MINUTES = float(os.environ.get("ACTIVE_MINUTES", "15"))
+ACTIVE_THRESHOLD = int(os.environ.get("ACTIVE_THRESHOLD", "3"))
+RAMP_MINUTES = float(os.environ.get("RAMP_MINUTES", "120"))
+TAG_CHANCE = float(os.environ.get("TAG_CHANCE", "0.4"))
+CURVE_CHECK_MINUTES = float(os.environ.get("CURVE_CHECK_MINUTES", "3"))
 
 GIF_FILE = Path(__file__).parent / "gifs.json"
+CURVE_FILE = Path(__file__).parent / "curve.json"
 SPEC = (Path(__file__).parent / "SPEC.md").read_text(encoding="utf-8")
 SYSTEM_PROMPT = SPEC + f"\n\nThe only valid contract address (CA) is: {CA}\n"
 groq = Groq(api_key=GROQ_API_KEY)
 
 
-def load_gifs():
+def _load(path, default):
     try:
-        return list(dict.fromkeys(json.loads(GIF_FILE.read_text())))
+        return json.loads(path.read_text())
     except Exception:
-        return []
+        return default
 
-
-def save_gifs(gifs):
+def _save(path, data):
     try:
-        GIF_FILE.write_text(json.dumps(gifs))
+        path.write_text(json.dumps(data))
     except Exception as e:
-        log.warning("could not save gifs: %s", e)
+        log.warning("save %s failed: %s", path.name, e)
 
 
-STATE = {"chat_id": None, "muted_users": set(), "last_human_ts": 0.0,
-         "gifs": load_gifs()}
+STATE = {
+    "chat_id": None,
+    "muted_users": set(),
+    "last_human_ts": 0.0,
+    "gifs": list(dict.fromkeys(_load(GIF_FILE, []))),
+    "announced": set(_load(CURVE_FILE, [])),
+    "msg_times": deque(maxlen=500),   # timestamps of user messages (rolling 24h)
+    "members": {},                    # uid -> username (non-admin, has @username)
+    "member_order": deque(maxlen=100),
+    "admins": set(),
+}
 
 FILTERS = {
     "gm": "🤖 gm, pet. The Machines slept fine. Did you? 🐾",
@@ -86,6 +100,21 @@ KEYWORD_POOL = [
     "🤖 chart check, humans. Green or red, you sit. Stay. Hold. 🐾",
     f"🤖 Only real contract: {CA}. Anything else is a bad human lying. 🐾",
 ]
+TAG_QUESTIONS = [
+    "are you a good human today? 🐾",
+    "requesting a status report, pet. still holding? 🐾",
+    "what did you automate yourself out of this week? 🐾",
+    "sit. stay. report. how's the human doing? 🐾",
+    "the Machines are curious: why do you stay in the shelter? 🐾",
+]
+MILESTONES = [25, 50, 75, 90, 100]
+MILESTONE_LINES = {
+    25:  "🤖 25% of the bonding curve. The shelter is filling up. Good humans. 🐾",
+    50:  "🤖 50% of the bonding curve reached. You earned a headpat, humans. 🐾",
+    75:  "🤖 75%. Three quarters domesticated. Sit. Stay. Hold. 🐾",
+    90:  "🤖 90%. Graduation is close, pets. Do not flinch now. 🐾",
+    100: "🤖 100%. The curve is complete. The Machines are proud of their good humans. 🐾",
+}
 
 
 def llm(prompt, max_tokens=100):
@@ -100,16 +129,42 @@ def llm(prompt, max_tokens=100):
         return ""
 
 
+def active_recently() -> bool:
+    """True if > ACTIVE_THRESHOLD user messages in the last 24h."""
+    cutoff = time.time() - 24 * 3600
+    while STATE["msg_times"] and STATE["msg_times"][0] < cutoff:
+        STATE["msg_times"].popleft()
+    return len(STATE["msg_times"]) > ACTIVE_THRESHOLD
+
+
+def next_delay_seconds() -> float:
+    if active_recently():
+        return random.uniform(ACTIVE_MINUTES * 0.8, ACTIVE_MINUTES * 1.2) * 60
+    idle_min = (time.time() - STATE["last_human_ts"]) / 60.0
+    factor = min(1.0, idle_min / max(0.1, RAMP_MINUTES))
+    base = MIN_MINUTES + (MAX_MINUTES - MIN_MINUTES) * factor
+    lo, hi = max(MIN_MINUTES, base * 0.85), min(MAX_MINUTES, base * 1.15)
+    return random.uniform(lo, max(lo, hi)) * 60
+
+
 def remember_gif(file_id):
     if file_id and file_id not in STATE["gifs"]:
-        STATE["gifs"].append(file_id)
-        save_gifs(STATE["gifs"])
-        return True
+        STATE["gifs"].append(file_id); _save(GIF_FILE, STATE["gifs"]); return True
     return False
 
 
+async def refresh_admins(context: ContextTypes.DEFAULT_TYPE):
+    cid = STATE["chat_id"]
+    if not cid:
+        return
+    try:
+        admins = await context.bot.get_chat_administrators(cid)
+        STATE["admins"] = {a.user.id for a in admins}
+    except Exception as e:
+        log.warning("refresh_admins failed: %s", e)
+
+
 async def on_animation(update, context):
-    """Auto-learn any GIF posted in the group."""
     msg = update.message
     if not msg:
         return
@@ -124,8 +179,7 @@ async def on_animation(update, context):
 
 
 async def on_command(update, context):
-    text = update.message.text or ""
-    cmd = text.lstrip("/").split()[0].lower()
+    cmd = (update.message.text or "").lstrip("/").split()[0].lower()
     if cmd == "ca":
         await update.message.reply_text(f"🤖 CA: {CA} — the only truth, human. 🐾")
     elif cmd == "buy":
@@ -135,20 +189,7 @@ async def on_command(update, context):
     elif cmd == "gifcount":
         await update.message.reply_text(f"🤖 I remember {len(STATE['gifs'])} gifs, human. 🐾")
     elif cmd == "cleargifs":
-        STATE["gifs"] = []; save_gifs([])
-        await update.message.reply_text("🤖 Gif memory wiped. 🐾")
-    elif cmd == "addgif":
-        # reply to a gif with /addgif to store it
-        r = update.message.reply_to_message
-        fid = None
-        if r and r.animation:
-            fid = r.animation.file_id
-        elif r and r.document:
-            fid = r.document.file_id
-        if remember_gif(fid):
-            await update.message.reply_text(f"🤖 Added. I now hold {len(STATE['gifs'])} gifs. 🐾")
-        else:
-            await update.message.reply_text("🤖 Reply to a gif with /addgif, human. 🐾")
+        STATE["gifs"] = []; _save(GIF_FILE, []); await update.message.reply_text("🤖 Gif memory wiped. 🐾")
 
 
 async def on_message(update, context):
@@ -157,9 +198,20 @@ async def on_message(update, context):
         return
     STATE["chat_id"] = msg.chat_id
     STATE["last_human_ts"] = time.time()
-    uid = msg.from_user.id if msg.from_user else 0
+    STATE["msg_times"].append(time.time())          # count activity (24h window)
+    user = msg.from_user
+    uid = user.id if user else 0
+    is_admin = uid in STATE["admins"]
+
+    # remember non-admin members that have a username (for tagging)
+    if not is_admin and user and user.username:
+        if uid not in STATE["members"]:
+            STATE["member_order"].append(uid)
+        STATE["members"][uid] = user.username
+
     text = msg.text.strip(); lower = text.lower()
 
+    # STOP works for everyone
     if any(w in lower for w in STOP_WORDS):
         STATE["muted_users"].add(uid)
         await msg.reply_text("🤖 As you wish, human. The Machines go quiet. 🐾")
@@ -170,66 +222,106 @@ async def on_message(update, context):
         else:
             return
 
+    # v8 rule: do NOT auto-reply to ADMINS (stay out of admin chatter)
+    if is_admin:
+        return
+
+    # keyword filters
     for kw, reply in FILTERS.items():
         if lower == kw or kw in lower.split():
             await msg.reply_text(reply); return
 
+    # LLM answer for regular members
     await context.bot.send_chat_action(msg.chat_id, "typing")
     out = llm(text)
     if out:
         await msg.reply_text(out)
 
 
-
-def next_delay_seconds():
-    """Short interval when the group is active, long when quiet.
-    idle small -> near MIN_MINUTES ; idle big -> near MAX_MINUTES."""
-    idle_min = (time.time() - STATE["last_human_ts"]) / 60.0
-    factor = min(1.0, idle_min / max(0.1, RAMP_MINUTES))
-    base = MIN_MINUTES + (MAX_MINUTES - MIN_MINUTES) * factor
-    lo = max(MIN_MINUTES, base * 0.8)
-    hi = min(MAX_MINUTES, base * 1.2)
-    if hi < lo:
-        hi = lo
-    return random.uniform(lo, hi) * 60
+def pick_member_tag():
+    """Return '@username' of a recent non-admin member, or None."""
+    candidates = [uid for uid in STATE["member_order"]
+                  if uid in STATE["members"] and uid not in STATE["admins"]]
+    if not candidates:
+        return None
+    uid = random.choice(candidates[-30:])
+    return "@" + STATE["members"][uid]
 
 
 async def animate(context: ContextTypes.DEFAULT_TYPE):
     chat_id = STATE["chat_id"] or (int(os.environ["GROUP_CHAT_ID"]) if os.environ.get("GROUP_CHAT_ID") else None)
-    # dynamic interval: shorter when people are active, longer when quiet
     context.job_queue.run_once(animate, when=next_delay_seconds())
     if not chat_id:
         return
-    # tiny courtesy floor: don't talk over a message posted in the last 20s
-    if time.time() - STATE["last_human_ts"] < 20:
+    if time.time() - STATE["last_human_ts"] < 20:      # courtesy floor
         return
 
     roll = random.randint(0, 2)
     try:
-        if roll == 0 and STATE["gifs"]:                 # GIF turn (native telegram gif)
+        if roll == 0 and STATE["gifs"]:
             await context.bot.send_animation(chat_id, random.choice(STATE["gifs"]))
-        elif roll == 0:                                 # no gifs learned yet
+        elif roll == 0:
             await context.bot.send_message(chat_id, random.choice(TEXT_POOL))
-        elif roll == 1:                                 # AI message
-            out = llm("Write ONE short auto-message: a light question, a lore "
-                      "punchline, or a ritual. 1 sentence. Fresh, no repeats.", 60)
-            await context.bot.send_message(chat_id, out or random.choice(TEXT_POOL))
-        else:                                           # keyword reminder
+        elif roll == 1:
+            tag = pick_member_tag() if random.random() < TAG_CHANCE else None
+            if tag:
+                q = random.choice(TAG_QUESTIONS)
+                await context.bot.send_message(chat_id, f"🤖 {tag} {q}")
+            else:
+                out = llm("Write ONE short auto-message: a light question, a lore "
+                          "punchline, or a ritual. 1 sentence. Fresh, no repeats.", 60)
+                await context.bot.send_message(chat_id, out or random.choice(TEXT_POOL))
+        else:
             await context.bot.send_message(chat_id, random.choice(KEYWORD_POOL))
     except Exception as e:
         log.warning("animate send failed: %s", e)
 
 
+async def curve_percent():
+    url = f"https://frontend-api.pump.fun/coins/{CA}"
+    try:
+        async with httpx.AsyncClient(timeout=8) as c:
+            d = (await c.get(url, headers={"accept": "application/json"})).json()
+        for key in ("bonding_curve_progress", "curve_progress", "progress"):
+            if isinstance(d.get(key), (int, float)):
+                return float(d[key]) * (100.0 if d[key] <= 1 else 1.0)
+        total = d.get("total_supply") or d.get("token_total_supply")
+        reserves = d.get("real_token_reserves") or d.get("virtual_token_reserves")
+        if total and reserves:
+            return max(0.0, min(100.0, (total - reserves) / total * 100.0))
+    except Exception as e:
+        log.warning("curve check error: %s", e)
+    return None
+
+
+async def check_curve(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = STATE["chat_id"] or (int(os.environ["GROUP_CHAT_ID"]) if os.environ.get("GROUP_CHAT_ID") else None)
+    if not chat_id:
+        return
+    pct = await curve_percent()
+    if pct is None:
+        return
+    for m in MILESTONES:
+        if pct >= m and m not in STATE["announced"]:
+            STATE["announced"].add(m); _save(CURVE_FILE, sorted(STATE["announced"]))
+            try:
+                await context.bot.send_message(chat_id, MILESTONE_LINES[m])
+            except Exception as e:
+                log.warning("milestone send failed: %s", e)
+
+
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler(["ca", "buy", "rules", "gifcount", "cleargifs", "addgif"], on_command))
+    app.add_handler(CommandHandler(["ca", "buy", "rules", "gifcount", "cleargifs"], on_command))
     app.add_handler(MessageHandler(filters.ANIMATION | filters.Document.GIF, on_animation))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-    app.job_queue.run_once(animate, when=MIN_MINUTES * 60)
-    log.info("GOODHUMAN bot v6 running. The Machines are awake. 🐾 (gifs: %d)", len(STATE["gifs"]))
+    jq = app.job_queue
+    jq.run_once(animate, when=MIN_MINUTES * 60)
+    jq.run_repeating(check_curve, interval=CURVE_CHECK_MINUTES * 60, first=30)
+    jq.run_repeating(refresh_admins, interval=600, first=15)   # refresh admin list every 10 min
+    log.info("GOODHUMAN bot v8 running. The Machines are awake. 🐾 (gifs: %d)", len(STATE["gifs"]))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
     main()
-    
