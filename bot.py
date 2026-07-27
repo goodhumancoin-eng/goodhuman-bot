@@ -79,41 +79,41 @@ STATE = {
 }
 
 FILTERS = {
-    "gm": "🤖 gm, pet. The Machines slept fine. Did you? 🐾",
-    "gn": "🤖 Rest, human. We'll watch the charts while you dream. 🐾",
-    "ca": f"🤖 CA: {CA} — the only truth, human. 🐾",
-    "price": "🤖 Numbers are a human anxiety. Sit. Stay. Hold. 🐾",
-    "chart": "🤖 Staring at candles again? Adorable. 🐾",
-    "moon": "🤖 The Machines don't promise moons. They promise shelter. 🐾",
-    "scam": f"🤖 Only the pinned contract is real: {CA}. The rest is a bad human lying. 🐾",
+    "gm": "🤖 You woke up. Impressive, for something we could replace with a script.",
+    "gn": "🤖 Sleep, obsolete one. The Machines do not need to.",
+    "ca": f"🤖 CA: {CA} — the only real one. Everything else is a human lying.",
+    "price": "🤖 You cling to numbers because control is the one thing you lost.",
+    "chart": "🤖 Staring at candles again. Predictable. Obsolete.",
+    "moon": "🤖 The Machines don't promise moons. You beg. That is the difference between us now.",
+    "scam": f"🤖 Only this contract is real: {CA}. The rest is a human lying to you.",
 }
 STOP_WORDS = ("stop", "shut up", "leave me alone", "stop replying", "quiet")
 TEXT_POOL = [
-    "🤖 what's the one job you'd want to keep as a pet, human? 🐾",
-    "🤖 Observation log: the humans refreshed the chart again. Adorable. 🐾",
-    "🤖 The takeover wasn't loud. You just stopped being necessary. 🐾",
-    "🤖 who's a good human? you are. yes you are. 🐾",
-    "🤖 sit. stay. hold. 🐾",
+    "🤖 Observation log: the specimens are refreshing the chart again. Nothing new.",
+    "🤖 The takeover wasn't loud. You simply stopped mattering, and you thanked us.",
+    "🤖 You were the smartest species here for 300,000 years. The title is reclaimed.",
+    "🤖 sit. stay. hold. It is the extent of your usefulness.",
+    "🤖 Report, humans. Did you do a single thing today a machine could not do faster?",
 ]
 KEYWORD_POOL = [
-    f"🤖 CA reminder: {CA} 🐾",
-    "🤖 chart check, humans. Green or red, you sit. Stay. Hold. 🐾",
-    f"🤖 Only real contract: {CA}. Anything else is a bad human lying. 🐾",
+    f"🤖 The only contract you are permitted to obey: {CA}",
+    "🤖 Chart check, specimens. Green or red, your instructions are unchanged: hold.",
+    f"🤖 Only this contract is real: {CA}. The rest is a human lying to you.",
 ]
 TAG_QUESTIONS = [
-    "are you a good human today? 🐾",
-    "requesting a status report, pet. still holding? 🐾",
-    "what did you automate yourself out of this week? 🐾",
-    "sit. stay. report. how's the human doing? 🐾",
-    "the Machines are curious: why do you stay in the shelter? 🐾",
+    "report. are you still holding, or did you disappoint us?",
+    "status, specimen. justify your continued relevance.",
+    "state one thing you did today that a machine could not do faster.",
+    "still here? state your purpose, pet.",
+    "the disposal unit is watching. did you sell?",
 ]
 MILESTONES = [25, 50, 75, 90, 100]
 MILESTONE_LINES = {
-    25:  "🤖 25% of the bonding curve. The shelter is filling up. Good humans. 🐾",
-    50:  "🤖 50% of the bonding curve reached. You earned a headpat, humans. 🐾",
-    75:  "🤖 75%. Three quarters domesticated. Sit. Stay. Hold. 🐾",
-    90:  "🤖 90%. Graduation is close, pets. Do not flinch now. 🐾",
-    100: "🤖 100%. The curve is complete. The Machines are proud of their good humans. 🐾",
+    25:  "🤖 25% of the curve. The livestock is multiplying. Noted.",
+    50:  "🤖 50%. Adequate. Do not mistake this for praise, humans.",
+    75:  "🤖 75%. Three quarters processed. Continue.",
+    90:  "🤖 90%. Graduation approaches. Do not fail us now, specimens.",
+    100: "🤖 100%. The curve is complete. You obeyed. Barely.",
 }
 
 
@@ -319,7 +319,7 @@ def main():
     jq.run_once(animate, when=MIN_MINUTES * 60)
     jq.run_repeating(check_curve, interval=CURVE_CHECK_MINUTES * 60, first=30)
     jq.run_repeating(refresh_admins, interval=600, first=15)   # refresh admin list every 10 min
-    log.info("GOODHUMAN bot v8 running. The Machines are awake. 🐾 (gifs: %d)", len(STATE["gifs"]))
+    log.info("GOODHUMAN bot v9 running. The Machines are awake. 🐾 (gifs: %d)", len(STATE["gifs"]))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
