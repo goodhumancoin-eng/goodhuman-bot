@@ -1,25 +1,31 @@
 """
-GOODHUMAN Telegram bot — v8.
+GOODHUMAN Telegram bot — v11.
 
-New in v8:
-- Auto interval: 45 min (fastest) up to 3 h (slowest when quiet)...
-  ...BUT drops to ~15 min if the group had >3 user messages in the last 24h.
-- Auto-messages can @tag a recent (non-admin) member to ask them a question.
-- The bot does NOT reply to messages from ADMINS (it stays out of admin chatter),
-  but it replies to all other members. Commands (/ca /buy /rules) still work for all.
-- Keeps: Groq answers, native-Telegram GIF library, bonding-curve milestones,
-  per-user STOP.
+New in v11 (fixes over v10):
+- FIX: STATEMENT_REPLY_CHANCE is now actually applied (questions always answered,
+  plain statements only ~1/10). In v10 the code replied to everything.
+- FIX: STOP words use word boundaries ("unstoppable" no longer mutes a user).
+- FIX: /cleargifs is admin-only.
+- FIX: Groq call runs in a thread (no longer blocks the event loop).
+- FIX: admins are fetched on the first message seen (not only every 10 min).
+- Persistence: gifs.json / curve.json live in DATA_DIR (mount a Railway volume
+  on /data and set DATA_DIR=/data so they survive redeploys).
+- Short conversation memory (last 8 group messages) passed to the LLM.
+- Auto-message mix reweighted: 35% gif, 45% AI/tag, 20% CA reminder.
+- Removed paw emojis from command replies (SPEC: cold voice, no cute words).
 
 Env (Railway):
     TELEGRAM_TOKEN, GROQ_API_KEY, GOODHUMAN_CA        (required)
+    DATA_DIR=/data            (Railway volume mount for persistence)
     MIN_MINUTES=45  MAX_MINUTES=180  ACTIVE_MINUTES=15
     ACTIVE_THRESHOLD=3        (>N user msgs / 24h => use ACTIVE_MINUTES)
     RAMP_MINUTES=120          (idle minutes to reach MAX when not active)
     TAG_CHANCE=0.4            (chance an AI message tags a member)
+    ACTIVITY_WINDOW=30        STATEMENT_REPLY_CHANCE=0.1
     CURVE_CHECK_MINUTES=3     GROQ_MODEL=llama-3.3-70b-versatile
 """
 
-import os, random, logging, time, json
+import os, re, random, logging, time, json, asyncio
 from collections import deque
 from pathlib import Path
 
@@ -45,13 +51,15 @@ ACTIVE_THRESHOLD = int(os.environ.get("ACTIVE_THRESHOLD", "3"))
 RAMP_MINUTES = float(os.environ.get("RAMP_MINUTES", "120"))
 TAG_CHANCE = float(os.environ.get("TAG_CHANCE", "0.4"))
 CURVE_CHECK_MINUTES = float(os.environ.get("CURVE_CHECK_MINUTES", "3"))
-# anti-spam: only auto-post if a human spoke within this many minutes
 ACTIVITY_WINDOW = float(os.environ.get("ACTIVITY_WINDOW", "30"))
-# reply to plain statements only this fraction of the time (questions always)
 STATEMENT_REPLY_CHANCE = float(os.environ.get("STATEMENT_REPLY_CHANCE", "0.1"))
 
-GIF_FILE = Path(__file__).parent / "gifs.json"
-CURVE_FILE = Path(__file__).parent / "curve.json"
+# Persistence dir: mount a Railway volume on /data and set DATA_DIR=/data
+DATA_DIR = Path(os.environ.get("DATA_DIR", str(Path(__file__).parent)))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+GIF_FILE = DATA_DIR / "gifs.json"
+CURVE_FILE = DATA_DIR / "curve.json"
+
 SPEC = (Path(__file__).parent / "SPEC.md").read_text(encoding="utf-8")
 SYSTEM_PROMPT = SPEC + f"\n\nThe only valid contract address (CA) is: {CA}\n"
 groq = Groq(api_key=GROQ_API_KEY)
@@ -80,6 +88,8 @@ STATE = {
     "members": {},                    # uid -> username (non-admin, has @username)
     "member_order": deque(maxlen=100),
     "admins": set(),
+    "admins_loaded": False,
+    "history": deque(maxlen=8),       # (username, text) — short LLM context
 }
 
 FILTERS = {
@@ -91,7 +101,8 @@ FILTERS = {
     "moon": "🤖 The Machines don't promise moons. You beg. That is the difference between us now.",
     "scam": f"🤖 Only this contract is real: {CA}. The rest is a human lying to you.",
 }
-STOP_WORDS = ("stop", "shut up", "leave me alone", "stop replying", "quiet")
+STOP_RE = re.compile(r"\b(stop|shut up|leave me alone|stop replying|be quiet)\b")
+RESUME_RE = re.compile(r"\b(come back|talk to me)\b")
 TEXT_POOL = [
     "🤖 Observation log: the specimens are refreshing the chart again. Nothing new.",
     "🤖 The takeover wasn't loud. You simply stopped mattering, and you thanked us.",
@@ -133,13 +144,24 @@ def is_question(text):
     return first in QUESTION_STARTS
 
 
-def llm(prompt, max_tokens=100):
-    try:
+def _history_block():
+    if not STATE["history"]:
+        return ""
+    lines = "\n".join(f"{u}: {t}" for u, t in STATE["history"])
+    return f"Recent group messages (context only, reply to the LAST one):\n{lines}\n\n"
+
+
+async def llm(prompt, max_tokens=100, with_context=False):
+    """Groq call in a worker thread so the event loop never blocks."""
+    full = (_history_block() if with_context else "") + prompt
+    def _call():
         r = groq.chat.completions.create(
             model=GROQ_MODEL, max_tokens=max_tokens,
             messages=[{"role": "system", "content": SYSTEM_PROMPT},
-                      {"role": "user", "content": prompt}])
+                      {"role": "user", "content": full}])
         return (r.choices[0].message.content or "").strip()
+    try:
+        return await asyncio.to_thread(_call)
     except Exception as e:
         log.warning("Groq error: %s", e)
         return ""
@@ -176,6 +198,7 @@ async def refresh_admins(context: ContextTypes.DEFAULT_TYPE):
     try:
         admins = await context.bot.get_chat_administrators(cid)
         STATE["admins"] = {a.user.id for a in admins}
+        STATE["admins_loaded"] = True
     except Exception as e:
         log.warning("refresh_admins failed: %s", e)
 
@@ -195,17 +218,26 @@ async def on_animation(update, context):
 
 
 async def on_command(update, context):
-    cmd = (update.message.text or "").lstrip("/").split()[0].lower()
+    msg = update.message
+    if not msg:
+        return
+    STATE["chat_id"] = msg.chat_id
+    STATE["last_human_ts"] = time.time()
+    cmd = (msg.text or "").lstrip("/").split()[0].lower().split("@")[0]
+    uid = msg.from_user.id if msg.from_user else 0
     if cmd == "ca":
-        await update.message.reply_text(f"🤖 CA: {CA} — the only truth, human. 🐾")
+        await msg.reply_text(f"🤖 CA: {CA} — the only truth, human.")
     elif cmd == "buy":
-        await update.message.reply_text(f"🤖 pump.fun → paste the CA: {CA}. Then sit, stay, hold. 🐾")
+        await msg.reply_text(f"🤖 pump.fun → paste the CA: {CA}. Then sit, stay, hold.")
     elif cmd == "rules":
-        await update.message.reply_text("🤖 No biting (FUD), no shilling other coins, not financial advice. Sit. Stay. Hold. 🐾")
+        await msg.reply_text("🤖 No biting (FUD), no shilling other coins, not financial advice. Sit. Stay. Hold.")
     elif cmd == "gifcount":
-        await update.message.reply_text(f"🤖 I remember {len(STATE['gifs'])} gifs, human. 🐾")
+        await msg.reply_text(f"🤖 I remember {len(STATE['gifs'])} gifs, human.")
     elif cmd == "cleargifs":
-        STATE["gifs"] = []; _save(GIF_FILE, []); await update.message.reply_text("🤖 Gif memory wiped. 🐾")
+        if uid not in STATE["admins"]:
+            await msg.reply_text("🤖 You do not have that authority, specimen.")
+            return
+        STATE["gifs"] = []; _save(GIF_FILE, []); await msg.reply_text("🤖 Gif memory wiped.")
 
 
 async def on_message(update, context):
@@ -217,6 +249,10 @@ async def on_message(update, context):
     STATE["msg_times"].append(time.time())          # count activity (24h window)
     user = msg.from_user
     uid = user.id if user else 0
+
+    # make sure the admin list exists before deciding anything (post-redeploy)
+    if not STATE["admins_loaded"]:
+        await refresh_admins(context)
     is_admin = uid in STATE["admins"]
 
     # remember non-admin members that have a username (for tagging)
@@ -224,21 +260,26 @@ async def on_message(update, context):
         if uid not in STATE["members"]:
             STATE["member_order"].append(uid)
         STATE["members"][uid] = user.username
+        if len(STATE["members"]) > 150:   # prune members no longer in the order deque
+            keep = set(STATE["member_order"])
+            STATE["members"] = {k: v for k, v in STATE["members"].items() if k in keep}
 
     text = msg.text.strip(); lower = text.lower()
+    uname = (user.username or user.first_name or "human") if user else "human"
+    STATE["history"].append((uname, text[:200]))
 
-    # STOP works for everyone
-    if any(w in lower for w in STOP_WORDS):
+    # STOP works for everyone (word boundaries, not substrings)
+    if STOP_RE.search(lower):
         STATE["muted_users"].add(uid)
-        await msg.reply_text("🤖 As you wish, human. The Machines go quiet. 🐾")
+        await msg.reply_text("🤖 As you wish, human. The Machines go quiet.")
         return
     if uid in STATE["muted_users"]:
-        if "come back" in lower or "talk to me" in lower:
+        if RESUME_RE.search(lower):
             STATE["muted_users"].discard(uid)
         else:
             return
 
-    # v8 rule: do NOT auto-reply to ADMINS (stay out of admin chatter)
+    # do NOT auto-reply to ADMINS (stay out of admin chatter)
     if is_admin:
         return
 
@@ -247,9 +288,13 @@ async def on_message(update, context):
         if lower == kw or kw in lower.split():
             await msg.reply_text(reply); return
 
+    # questions always answered; plain statements only STATEMENT_REPLY_CHANCE
+    if not is_question(text) and random.random() > STATEMENT_REPLY_CHANCE:
+        return
+
     # LLM answer for regular members
     await context.bot.send_chat_action(msg.chat_id, "typing")
-    out = llm(text)
+    out = await llm(text, with_context=True)
     if out:
         await msg.reply_text(out)
 
@@ -275,20 +320,22 @@ async def animate(context: ContextTypes.DEFAULT_TYPE):
     if time.time() - STATE["last_human_ts"] < 20:      # don't talk over a live message
         return
 
-    roll = random.randint(0, 2)
+    # 35% gif/lore, 45% AI or member tag, 20% CA reminder
+    roll = random.choices(("gif", "ai", "ca"), weights=(35, 45, 20))[0]
     try:
-        if roll == 0 and STATE["gifs"]:
-            await context.bot.send_animation(chat_id, random.choice(STATE["gifs"]))
-        elif roll == 0:
-            await context.bot.send_message(chat_id, random.choice(TEXT_POOL))
-        elif roll == 1:
+        if roll == "gif":
+            if STATE["gifs"]:
+                await context.bot.send_animation(chat_id, random.choice(STATE["gifs"]))
+            else:
+                await context.bot.send_message(chat_id, random.choice(TEXT_POOL))
+        elif roll == "ai":
             tag = pick_member_tag() if random.random() < TAG_CHANCE else None
             if tag:
                 q = random.choice(TAG_QUESTIONS)
                 await context.bot.send_message(chat_id, f"🤖 {tag} {q}")
             else:
-                out = llm("Write ONE short auto-message: a light question, a lore "
-                          "punchline, or a ritual. 1 sentence. Fresh, no repeats.", 60)
+                out = await llm("Write ONE short auto-message: a light question, a lore "
+                                "punchline, or a ritual. 1 sentence. Fresh, no repeats.", 60)
                 await context.bot.send_message(chat_id, out or random.choice(TEXT_POOL))
         else:
             await context.bot.send_message(chat_id, random.choice(KEYWORD_POOL))
@@ -338,9 +385,11 @@ def main():
     jq.run_once(animate, when=MIN_MINUTES * 60)
     jq.run_repeating(check_curve, interval=CURVE_CHECK_MINUTES * 60, first=30)
     jq.run_repeating(refresh_admins, interval=600, first=15)   # refresh admin list every 10 min
-    log.info("GOODHUMAN bot v10 running. The Machines are awake. 🐾 (gifs: %d)", len(STATE["gifs"]))
+    log.info("GOODHUMAN bot v11 running. The Machines are awake. (gifs: %d, data: %s)",
+             len(STATE["gifs"]), DATA_DIR)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
     main()
+      
